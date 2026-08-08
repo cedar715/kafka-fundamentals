@@ -1,9 +1,23 @@
 version: "3.8"
 
-x-kafka-env: &kafka-env
-  KAFKA_PROCESS_ROLES: broker,controller
-  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+x-common-env: &common-env
+  # Same cluster ID must be shared by every node (controllers and brokers). Generate your own with:
+  # docker run --rm apache/kafka:latest /opt/kafka/bin/kafka-storage.sh random-uuid
+  CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@controller1:9093,2@controller2:9093,3@controller3:9093
   KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+x-controller-env: &controller-env
+  <<: *common-env
+  KAFKA_PROCESS_ROLES: controller
+  KAFKA_LISTENERS: CONTROLLER://:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT
+  # controllers hold only the metadata log, not partition data - light heap is enough
+  KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+
+x-broker-env: &broker-env
+  <<: *common-env
+  KAFKA_PROCESS_ROLES: broker
   KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
   KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
   KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
@@ -12,53 +26,98 @@ x-kafka-env: &kafka-env
   KAFKA_DEFAULT_REPLICATION_FACTOR: 3
   KAFKA_MIN_INSYNC_REPLICAS: 2
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-  # Same cluster ID must be shared by every node. Generate your own with:
-  # docker run --rm apache/kafka:latest /opt/kafka/bin/kafka-storage.sh random-uuid
-  CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+  KAFKA_HEAP_OPTS: "-Xmx1g -Xms1g"
 
 services:
-  kafka1:
+  # --- controller quorum: metadata only, no client traffic, not exposed to host ---
+  controller1:
     image: apache/kafka:latest
-    container_name: kafka1
+    container_name: controller1
+    environment:
+      <<: *controller-env
+      KAFKA_NODE_ID: 1
+    volumes:
+      - controller1-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  controller2:
+    image: apache/kafka:latest
+    container_name: controller2
+    environment:
+      <<: *controller-env
+      KAFKA_NODE_ID: 2
+    volumes:
+      - controller2-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  controller3:
+    image: apache/kafka:latest
+    container_name: controller3
+    environment:
+      <<: *controller-env
+      KAFKA_NODE_ID: 3
+    volumes:
+      - controller3-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  # --- brokers: serve data, replicate partitions, exposed to host for clients ---
+  broker1:
+    image: apache/kafka:latest
+    container_name: broker1
+    depends_on:
+      - controller1
+      - controller2
+      - controller3
     ports:
       - "29092:9094"
     environment:
-      <<: *kafka-env
-      KAFKA_NODE_ID: 1
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092,EXTERNAL://localhost:29092
+      <<: *broker-env
+      KAFKA_NODE_ID: 4
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker1:9092,EXTERNAL://localhost:29092
     volumes:
-      - kafka1-data:/var/lib/kafka/data
+      - broker1-data:/var/lib/kafka/data
     networks:
       - kafka-net
 
-  kafka2:
+  broker2:
     image: apache/kafka:latest
-    container_name: kafka2
+    container_name: broker2
+    depends_on:
+      - controller1
+      - controller2
+      - controller3
     ports:
       - "29093:9094"
     environment:
-      <<: *kafka-env
-      KAFKA_NODE_ID: 2
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9092,EXTERNAL://localhost:29093
+      <<: *broker-env
+      KAFKA_NODE_ID: 5
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker2:9092,EXTERNAL://localhost:29093
     volumes:
-      - kafka2-data:/var/lib/kafka/data
+      - broker2-data:/var/lib/kafka/data
     networks:
       - kafka-net
 
-  kafka3:
+  broker3:
     image: apache/kafka:latest
-    container_name: kafka3
+    container_name: broker3
+    depends_on:
+      - controller1
+      - controller2
+      - controller3
     ports:
       - "29094:9094"
     environment:
-      <<: *kafka-env
-      KAFKA_NODE_ID: 3
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9092,EXTERNAL://localhost:29094
+      <<: *broker-env
+      KAFKA_NODE_ID: 6
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker3:9092,EXTERNAL://localhost:29094
     volumes:
-      - kafka3-data:/var/lib/kafka/data
+      - broker3-data:/var/lib/kafka/data
     networks:
       - kafka-net
 
@@ -66,14 +125,14 @@ services:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     depends_on:
-      - kafka1
-      - kafka2
-      - kafka3
+      - broker1
+      - broker2
+      - broker3
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local-kraft-cluster
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker1:9092,broker2:9092,broker3:9092
     networks:
       - kafka-net
 
@@ -82,6 +141,9 @@ networks:
     driver: bridge
 
 volumes:
-  kafka1-data:
-  kafka2-data:
-  kafka3-data:
+  controller1-data:
+  controller2-data:
+  controller3-data:
+  broker1-data:
+  broker2-data:
+  broker3-data:

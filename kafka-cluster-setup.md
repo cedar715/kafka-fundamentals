@@ -1,6 +1,6 @@
-# 3-Node Kafka Cluster (KRaft, Docker Compose)
+# 6-Node Kafka Cluster (KRaft, Dedicated Controllers + Brokers, Docker Compose)
 
-Combined mode: all 3 nodes act as both broker and controller. Simplest way to see replication, leader election, and ISR behavior without ZooKeeper.
+Dedicated mode: 3 controller-only nodes (metadata/Raft quorum, not exposed to host) + 3 broker-only nodes (serve data, replicate partitions). Closer to a real production topology than combined mode — controller and broker failures are isolated from each other.
 
 ## 0. Prereqs
 
@@ -14,79 +14,106 @@ docker compose version
 
 ## 1. (Optional) Generate your own cluster ID
 
-The compose file ships with a placeholder CLUSTER_ID. Any 3+ nodes sharing one ID form one cluster — fine to reuse the placeholder for learning, or generate your own:
+The compose file ships with a placeholder CLUSTER_ID. All 6 nodes must share the same ID to form one cluster — fine to reuse the placeholder for learning, or generate your own:
 
 ```bash
 docker run --rm apache/kafka:latest /opt/kafka/bin/kafka-storage.sh random-uuid
 ```
 
-Paste the result into `CLUSTER_ID` in `docker-compose.yml` (all 3 brokers inherit it via the shared `x-kafka-env` block, so you only edit it once).
+Paste the result into `CLUSTER_ID` in the `x-common-env` block in `docker-compose.yml` — both controllers and brokers inherit it from there, so you only edit it once.
 
 ## 2. Start the cluster
 
 ```bash
 docker compose up -d
 docker compose ps
-docker compose logs -f kafka1   # watch for "Kafka Server started"
+docker compose logs -f controller1   # watch for it joining the quorum
+docker compose logs -f broker1       # watch for "Kafka Server started"
 ```
 
 Kafka UI (visual view of brokers/topics/partitions): http://localhost:8080
 
-Resource check on your machine (4c/8t, 30GB RAM) — 3 JVM brokers + UI is comfortably within budget; each broker defaults to ~1GB heap.
+Resource check on your machine (4c/8t, 30GB RAM, 28GB free): 6 JVM nodes + UI. Controllers are capped at 512MB heap (they only hold the metadata log, no partition data), brokers at 1GB. Total footprint roughly 6-8GB including JVM overhead — comfortable headroom on this box. CPU is the more likely limit under real load, not memory.
 
 ## 3. Verify the cluster is up
 
 ```bash
-docker exec -it kafka1 /opt/kafka/bin/kafka-metadata-quorum.sh \
-  --bootstrap-server localhost:9092 describe --status
+docker exec -it controller1 /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server controller1:9093 describe --status
 ```
 
-Should list all 3 node IDs, one as leader (controller).
+Should list all 3 controller node IDs (1-3), one as the quorum leader.
+
+```bash
+docker exec -it broker1 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server localhost:9092
+```
+
+Should list all 3 brokers (node IDs 4-6).
 
 ## 4. Create a replicated topic
 
 ```bash
-docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+docker exec -it broker1 /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 \
   --create --topic test-topic --partitions 3 --replication-factor 3
 
-docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+docker exec -it broker1 /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --describe --topic test-topic
 ```
 
-Note which broker is the Leader for each partition, and the Isr (in-sync replica) list.
+Note which broker (4, 5, or 6) is the Leader for each partition, and the Isr (in-sync replica) list.
 
 ## 5. Produce / consume
 
 ```bash
 # producer (from host, using external listener)
-docker exec -it kafka1 /opt/kafka/bin/kafka-console-producer.sh \
+docker exec -it broker1 /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server localhost:9092 --topic test-topic
 
 # consumer, separate terminal
-docker exec -it kafka2 /opt/kafka/bin/kafka-console-consumer.sh \
+docker exec -it broker2 /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic test-topic --from-beginning
 ```
 
-## 6. Test failover (the actual point of a multi-node cluster)
+## 6. Test failover — two distinct failure modes now
+
+Because roles are split, a broker dying and a controller dying are separate, isolated events. Worth testing both.
+
+**Kill a broker (data-plane failure):**
 
 ```bash
-# find current leader for partition 0 from step 4's describe output, then kill it
-docker stop kafka<leader-id>
+# stop the current partition leader from step 4's describe output
+docker stop broker<n>
 
-# re-describe the topic — a new leader should have been elected, Isr shrinks by one
-docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh \
+# re-describe — a new leader elected from the remaining ISR
+docker exec -it broker1 /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --describe --topic test-topic
 
-# producer/consumer above should keep working uninterrupted (replication factor 3,
-# min.insync.replicas 2 means it survives one node down)
+# producer/consumer keep working (replication factor 3, min.insync.replicas 2
+# survives one broker down); controllers are untouched
 
-# bring it back
-docker start kafka<leader-id>
-# watch it rejoin ISR
+docker start broker<n>   # watch it rejoin the ISR
 ```
 
-Caveat with combined mode: killing a node removes both its broker and controller roles at once. If you kill 2 of 3, you lose controller quorum majority and the cluster can't process metadata changes (existing topics keep working, but you can't create/alter topics) — that's expected and itself a useful thing to observe.
+**Kill a controller (control-plane failure):**
+
+```bash
+# find the quorum leader from step 3, stop a different one (a follower) first
+docker stop controller<n>
+
+# quorum still has 2/3 — still has majority, cluster keeps functioning normally
+docker exec -it controller1 /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server controller1:9093 describe --status
+
+# producer/consumer traffic is completely unaffected - brokers don't need
+# the controller for steady-state reads/writes, only for metadata changes
+# (new topics, partition reassignment, broker registration)
+
+docker start controller<n>
+```
+
+Then try stopping 2 of 3 controllers — quorum drops below majority. Existing topic reads/writes on brokers keep working (data plane is independent), but you can't create/alter topics or register a new broker until quorum is restored. This is the behavior combined mode couldn't show you cleanly, since there a node loss always hit both planes together.
 
 ## 7. Tear down
 
@@ -97,6 +124,7 @@ docker compose down -v       # stop and wipe all data (fresh cluster next time)
 
 ## Where to go next
 
-- Kill the controller quorum leader specifically (shown in step 3's describe output) vs a follower — compare recovery time.
-- Change `min.insync.replicas` to 3 and watch producers with `acks=all` block when a broker is down.
-- Split broker and controller roles onto dedicated nodes (`process.roles=controller` only vs `broker` only) to see a topology closer to a real production cluster — the current combined-mode setup is easier to run but hides some failure modes.
+- Compare recovery time: kill the controller quorum *leader* specifically vs a follower.
+- Set `min.insync.replicas` to 3 and watch producers with `acks=all` block when a broker is down.
+- Simulate a rolling restart (one node at a time, controllers first then brokers) the way you'd patch a real cluster.
+- Add a 4th and 5th controller to see how quorum size trades off recovery speed vs write latency (every metadata write needs majority ack).
